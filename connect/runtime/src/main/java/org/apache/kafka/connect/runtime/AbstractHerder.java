@@ -26,10 +26,13 @@ import org.apache.kafka.common.config.ConfigDef.ConfigKey;
 import org.apache.kafka.common.config.ConfigDef.Type;
 import org.apache.kafka.common.config.ConfigTransformer;
 import org.apache.kafka.common.config.ConfigValue;
+import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.connect.connector.Connector;
 import org.apache.kafka.connect.connector.policy.ConnectorClientConfigOverridePolicy;
 import org.apache.kafka.connect.connector.policy.ConnectorClientConfigRequest;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.NotFoundException;
+import org.apache.kafka.connect.runtime.isolation.LoaderSwap;
 import org.apache.kafka.connect.runtime.isolation.PluginType;
 import org.apache.kafka.connect.runtime.isolation.Plugins;
 import org.apache.kafka.connect.runtime.rest.entities.ActiveTopicsInfo;
@@ -52,6 +55,8 @@ import org.apache.kafka.connect.transforms.Transformation;
 import org.apache.kafka.connect.transforms.predicates.Predicate;
 import org.apache.kafka.connect.util.Callback;
 import org.apache.kafka.connect.util.ConnectorTaskId;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
@@ -80,10 +85,12 @@ import java.util.stream.Collectors;
 /**
  * Abstract Herder implementation which handles connector/task lifecycle tracking. Extensions
  * must invoke the lifecycle hooks appropriately.
- *
+ * <p>
  * This class takes the following approach for sending status updates to the backing store:
  *
- * 1) When the connector or task is starting, we overwrite the previous state blindly. This ensures that
+ * <ol>
+ * <li>
+ *    When the connector or task is starting, we overwrite the previous state blindly. This ensures that
  *    every rebalance will reset the state of tasks to the proper state. The intuition is that there should
  *    be less chance of write conflicts when the worker has just received its assignment and is starting tasks.
  *    In particular, this prevents us from depending on the generation absolutely. If the group disappears
@@ -91,14 +98,18 @@ import java.util.stream.Collectors;
  *    generation with the updated one. The danger of this approach is that slow starting tasks may cause the
  *    status to be overwritten after a rebalance has completed.
  *
- * 2) If the connector or task fails or is shutdown, we use {@link StatusBackingStore#putSafe(ConnectorStatus)},
+ * <li>
+ *    If the connector or task fails or is shutdown, we use {@link StatusBackingStore#putSafe(ConnectorStatus)},
  *    which provides a little more protection if the worker is no longer in the group (in which case the
  *    task may have already been started on another worker). Obviously this is still racy. If the task has just
  *    started on another worker, we may not have the updated status cached yet. In this case, we'll overwrite
  *    the value which will cause the state to be inconsistent (most likely until the next rebalance). Until
  *    we have proper producer groups with fenced groups, there is not much else we can do.
+ * </ol>
  */
 public abstract class AbstractHerder implements Herder, TaskStatus.Listener, ConnectorStatus.Listener {
+
+    private final Logger log = LoggerFactory.getLogger(AbstractHerder.class);
 
     private final String workerId;
     protected final Worker worker;
@@ -145,6 +156,7 @@ public abstract class AbstractHerder implements Herder, TaskStatus.Listener, Con
         this.configBackingStore.stop();
         this.worker.stop();
         this.connectorExecutor.shutdown();
+        Utils.closeQuietly(this.connectorClientConfigOverridePolicy, "connector client config override policy");
     }
 
     @Override
@@ -280,7 +292,7 @@ public abstract class AbstractHerder implements Herder, TaskStatus.Listener, Con
             connector,
             config,
             configState.tasks(connector),
-            connectorTypeForClass(config.get(ConnectorConfig.CONNECTOR_CLASS_CONFIG))
+            connectorType(config)
         );
     }
 
@@ -318,8 +330,7 @@ public abstract class AbstractHerder implements Herder, TaskStatus.Listener, Con
         Collections.sort(taskStates);
 
         Map<String, String> conf = rawConfig(connName);
-        return new ConnectorStateInfo(connName, connectorState, taskStates,
-            conf == null ? ConnectorType.UNKNOWN : connectorTypeForClass(conf.get(ConnectorConfig.CONNECTOR_CLASS_CONFIG)));
+        return new ConnectorStateInfo(connName, connectorState, taskStates, connectorType(conf));
     }
 
     @Override
@@ -419,7 +430,7 @@ public abstract class AbstractHerder implements Herder, TaskStatus.Listener, Con
                 connectorName,
                 connectorInfoState,
                 taskStates,
-                conf == null ? ConnectorType.UNKNOWN : connectorTypeForClass(conf.get(ConnectorConfig.CONNECTOR_CLASS_CONFIG))
+                connectorType(conf)
         );
         return Optional.of(new RestartPlan(request, stateInfo));
     }
@@ -450,11 +461,11 @@ public abstract class AbstractHerder implements Herder, TaskStatus.Listener, Con
             throw new BadRequestException("Connector config " + connectorProps + " contains no connector type");
 
         Connector connector = getConnector(connType);
-        org.apache.kafka.connect.health.ConnectorType connectorType;
-        ClassLoader savedLoader = plugins().compareAndSwapLoaders(connector);
-        ConfigDef enrichedConfigDef;
-        Map<String, ConfigValue> validatedConnectorConfig;
-        try {
+        ClassLoader connectorLoader = plugins().connectorLoader(connType);
+        try (LoaderSwap loaderSwap = plugins().withClassLoader(connectorLoader)) {
+            org.apache.kafka.connect.health.ConnectorType connectorType;
+            ConfigDef enrichedConfigDef;
+            Map<String, ConfigValue> validatedConnectorConfig;
             if (connector instanceof SourceConnector) {
                 connectorType = org.apache.kafka.connect.health.ConnectorType.SOURCE;
                 enrichedConfigDef = ConnectorConfig.enrich(plugins(), SourceConnectorConfig.configDef(), connectorProps, false);
@@ -542,8 +553,6 @@ public abstract class AbstractHerder implements Herder, TaskStatus.Listener, Con
                     connectorClientConfigOverridePolicy);
             }
             return mergeConfigInfos(connType, configInfos, producerConfigInfos, consumerConfigInfos, adminConfigInfos);
-        } finally {
-            Plugins.compareAndSwapLoaders(savedLoader);
         }
     }
 
@@ -687,20 +696,25 @@ public abstract class AbstractHerder implements Herder, TaskStatus.Listener, Con
     }
 
     /**
-     * Retrieves ConnectorType for the corresponding connector class
-     * @param connClass class of the connector
-     */
-    public ConnectorType connectorTypeForClass(String connClass) {
-        return ConnectorType.from(getConnector(connClass).getClass());
-    }
-
-    /**
      * Retrieves ConnectorType for the class specified in the connector config
-     * @param connConfig the connector config; may not be null
-     * @return the {@link ConnectorType} of the connector
+     * @param connConfig the connector config, may be null
+     * @return the {@link ConnectorType} of the connector, or {@link ConnectorType#UNKNOWN} if an error occurs or the
+     * type cannot be determined
      */
-    public ConnectorType connectorTypeForConfig(Map<String, String> connConfig) {
-        return connectorTypeForClass(connConfig.get(ConnectorConfig.CONNECTOR_CLASS_CONFIG));
+    public ConnectorType connectorType(Map<String, String> connConfig) {
+        if (connConfig == null) {
+            return ConnectorType.UNKNOWN;
+        }
+        String connClass = connConfig.get(ConnectorConfig.CONNECTOR_CLASS_CONFIG);
+        if (connClass == null) {
+            return ConnectorType.UNKNOWN;
+        }
+        try {
+            return ConnectorType.from(getConnector(connClass).getClass());
+        } catch (ConnectException e) {
+            log.warn("Unable to retrieve connector type", e);
+            return ConnectorType.UNKNOWN;
+        }
     }
 
     /**
@@ -787,12 +801,18 @@ public abstract class AbstractHerder implements Herder, TaskStatus.Listener, Con
 
     @Override
     public List<ConfigKeyInfo> connectorPluginConfig(String pluginName) {
-        List<ConfigKeyInfo> results = new ArrayList<>();
-        ConfigDef configDefs;
+        Plugins p = plugins();
+        Class<?> pluginClass;
         try {
-            Plugins p = plugins();
+            pluginClass = p.pluginClass(pluginName);
+        } catch (ClassNotFoundException cnfe) {
+            throw new NotFoundException("Unknown plugin " + pluginName + ".");
+        }
+
+        try (LoaderSwap loaderSwap = p.withClassLoader(pluginClass.getClassLoader())) {
             Object plugin = p.newPlugin(pluginName);
             PluginType pluginType = PluginType.from(plugin.getClass());
+            ConfigDef configDefs;
             switch (pluginType) {
                 case SINK:
                 case SOURCE:
@@ -813,13 +833,14 @@ public abstract class AbstractHerder implements Herder, TaskStatus.Listener, Con
                 default:
                     throw new BadRequestException("Invalid plugin type " + pluginType + ". Valid types are sink, source, converter, header_converter, transformation, predicate.");
             }
-        } catch (ClassNotFoundException cnfe) {
-            throw new NotFoundException("Unknown plugin " + pluginName + ".");
+            List<ConfigKeyInfo> results = new ArrayList<>();
+            for (ConfigDef.ConfigKey configKey : configDefs.configKeys().values()) {
+                results.add(AbstractHerder.convertConfigKey(configKey));
+            }
+            return results;
+        } catch (ClassNotFoundException e) {
+            throw new ConnectException("Failed to load plugin class or one of its dependencies", e);
         }
-        for (ConfigDef.ConfigKey configKey : configDefs.configKeys().values()) {
-            results.add(AbstractHerder.convertConfigKey(configKey));
-        }
-        return results;
     }
 
 }

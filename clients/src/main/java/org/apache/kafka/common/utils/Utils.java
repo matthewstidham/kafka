@@ -28,6 +28,7 @@ import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.common.network.TransferableChannel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
 
 import java.io.Closeable;
 import java.io.DataOutput;
@@ -52,6 +53,9 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -595,13 +599,25 @@ public final class Utils {
      */
     public static <T> String join(Collection<T> collection, String separator) {
         Objects.requireNonNull(collection);
+        return mkString(collection.stream(), "", "", separator);
+    }
+
+    /**
+     * Create a string representation of a stream surrounded by `begin` and `end` and joined by `separator`.
+     *
+     * @return The string representation.
+     */
+    public static <T> String mkString(Stream<T> stream, String begin, String end, String separator) {
+        Objects.requireNonNull(stream);
         StringBuilder sb = new StringBuilder();
-        Iterator<T> iter = collection.iterator();
+        sb.append(begin);
+        Iterator<T> iter = stream.iterator();
         while (iter.hasNext()) {
             sb.append(iter.next());
             if (iter.hasNext())
                 sb.append(separator);
         }
+        sb.append(end);
         return sb.toString();
     }
 
@@ -981,6 +997,41 @@ public final class Utils {
         }
         if (exception != null)
             throw exception;
+    }
+    public static void swallow(final Logger log, final Level level, final String what, final Runnable code) {
+        swallow(log, level, what, code, null);
+    }
+
+    /**
+     * Run the supplied code. If an exception is thrown, it is swallowed and registered to the firstException parameter.
+     */
+    public static void swallow(final Logger log, final Level level, final String what, final Runnable code,
+                               final AtomicReference<Throwable> firstException) {
+        if (code != null) {
+            try {
+                code.run();
+            } catch (Throwable t) {
+                switch (level) {
+                    case INFO:
+                        log.info(what, t);
+                        break;
+                    case DEBUG:
+                        log.debug(what, t);
+                        break;
+                    case ERROR:
+                        log.error(what, t);
+                        break;
+                    case TRACE:
+                        log.trace(what, t);
+                        break;
+                    case WARN:
+                    default:
+                        log.warn(what, t);
+                }
+                if (firstException != null)
+                    firstException.compareAndSet(null, t);
+            }
+        }
     }
 
     /**
@@ -1450,4 +1501,23 @@ public final class Utils {
                 .toArray(String[]::new);
     }
 
+    /**
+     * Convert time instant to readable string for logging
+     * @param timestamp the timestamp of the instant to be converted.
+     *
+     * @return string value of a given timestamp in the format "yyyy-MM-dd HH:mm:ss,SSS"
+     */
+    public static String toLogDateTimeFormat(long timestamp) {
+        final DateTimeFormatter dateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss,SSS XXX");
+        return Instant.ofEpochMilli(timestamp).atZone(ZoneId.systemDefault()).format(dateTimeFormatter);
+    }
+
+    /**
+     * Replace the given string suffix with the new suffix. If the string doesn't end with the given suffix throw an exception.
+     */
+    public static String replaceSuffix(String str, String oldSuffix, String newSuffix) {
+        if (!str.endsWith(oldSuffix))
+            throw new IllegalArgumentException("Expected string to end with " + oldSuffix + " but string is " + str);
+        return str.substring(0, str.length() - oldSuffix.length()) + newSuffix;
+    }
 }

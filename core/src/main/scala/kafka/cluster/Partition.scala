@@ -44,6 +44,7 @@ import org.apache.kafka.common.utils.Time
 import org.apache.kafka.common.{IsolationLevel, TopicPartition, Uuid}
 import org.apache.kafka.metadata.LeaderRecoveryState
 import org.apache.kafka.server.common.MetadataVersion
+import org.apache.kafka.storage.internals.log.{AppendOrigin, FetchDataInfo, FetchIsolation, FetchParams, LogOffsetMetadata}
 
 import scala.collection.{Map, Seq}
 import scala.jdk.CollectionConverters._
@@ -373,7 +374,7 @@ class Partition(val topicPartition: TopicPartition,
 
   // Visible for testing
   private[cluster] def createLog(isNew: Boolean, isFutureReplica: Boolean, offsetCheckpoints: OffsetCheckpoints, topicId: Option[Uuid]): UnifiedLog = {
-    def updateHighWatermark(log: UnifiedLog) = {
+    def updateHighWatermark(log: UnifiedLog): Unit = {
       val checkpointHighWatermark = offsetCheckpoints.fetch(log.parentDir, topicPartition).getOrElse {
         info(s"No checkpointed highwatermark is found for partition $topicPartition")
         0L
@@ -808,7 +809,7 @@ class Partition(val topicPartition: TopicPartition,
   ): Unit = {
     if (isLeader) {
       val followers = replicas.filter(_ != localBrokerId)
-      val removedReplicas = remoteReplicasMap.keys.filter(!followers.contains(_))
+      val removedReplicas = remoteReplicasMap.keys.filterNot(followers.contains(_))
 
       // Due to code paths accessing remoteReplicasMap without a lock,
       // first add the new replicas and then remove the old ones
@@ -1188,7 +1189,7 @@ class Partition(val topicPartition: TopicPartition,
    * @param minOneMessage whether to ensure that at least one complete message is returned
    * @param updateFetchState true if the Fetch should update replica state (only applies to follower fetches)
    * @return [[LogReadInfo]] containing the fetched records or the diverging epoch if present
-   * @throws NotLeaderOrFollowerException if this node is not the current leader and [[FetchParams.fetchOnlyLeader]]
+   * @throws NotLeaderOrFollowerException if this node is not the current leader and `FetchParams.fetchOnlyLeader`
    *                                      is enabled, or if this is a follower fetch with an older request version
    *                                      and the replicaId is not recognized among the current valid replicas
    * @throws FencedLeaderEpochException if the leader epoch in the `Fetch` request is lower than the current
@@ -1197,7 +1198,7 @@ class Partition(val topicPartition: TopicPartition,
    *                                     leader epoch, or if this is a follower fetch and the replicaId is not
    *                                     recognized among the current valid replicas
    * @throws OffsetOutOfRangeException if the fetch offset is smaller than the log start offset or larger than
-   *                                   the log end offset (or high watermark depending on [[FetchParams.isolation]]),
+   *                                   the log end offset (or high watermark depending on `FetchParams.isolation`),
    *                                   or if the end offset for the last fetched epoch in [[FetchRequest.PartitionData]]
    *                                   cannot be determined from the local epoch cache (e.g. if it is larger than
    *                                   any cached epoch value)
@@ -1394,7 +1395,7 @@ class Partition(val topicPartition: TopicPartition,
       case ListOffsetsRequest.LATEST_TIMESTAMP =>
         maybeOffsetsError.map(e => throw e)
           .orElse(Some(new TimestampAndOffset(RecordBatch.NO_TIMESTAMP, lastFetchableOffset, Optional.of(leaderEpoch))))
-      case ListOffsetsRequest.EARLIEST_TIMESTAMP =>
+      case ListOffsetsRequest.EARLIEST_TIMESTAMP | ListOffsetsRequest.EARLIEST_LOCAL_TIMESTAMP =>
         getOffsetByTimestamp
       case _ =>
         getOffsetByTimestamp.filter(timestampAndOffset => timestampAndOffset.offset < lastFetchableOffset)

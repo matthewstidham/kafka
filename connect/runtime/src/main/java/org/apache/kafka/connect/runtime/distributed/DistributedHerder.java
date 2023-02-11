@@ -100,6 +100,7 @@ import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -118,12 +119,11 @@ import static org.apache.kafka.connect.runtime.distributed.IncrementalCooperativ
  * </p>
  * <p>
  *     Under the hood, this is implemented as a group managed by Kafka's group membership facilities (i.e. the generalized
- *     group/consumer coordinator). Each instance of DistributedHerder joins the group and indicates what it's current
+ *     group/consumer coordinator). Each instance of DistributedHerder joins the group and indicates what its current
  *     configuration state is (where it is in the configuration log). The group coordinator selects one member to take
- *     this information and assign each instance a subset of the active connectors & tasks to execute. This assignment
- *     is currently performed in a simple round-robin fashion, but this is not guaranteed -- the herder may also choose
- *     to, e.g., use a sticky assignment to avoid the usual start/stop costs associated with connectors and tasks. Once
- *     an assignment is received, the DistributedHerder simply runs its assigned connectors and tasks in a Worker.
+ *     this information and assign each instance a subset of the active connectors & tasks to execute. The assignment
+ *     strategy depends on the {@link ConnectAssignor} used. Once an assignment is received, the DistributedHerder simply
+ *     runs its assigned connectors and tasks in a {@link Worker}.
  * </p>
  * <p>
  *     In addition to distributing work, the DistributedHerder uses the leader determined during the work assignment
@@ -160,17 +160,18 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
 
     private final String workerGroupId;
     private final int workerSyncTimeoutMs;
-    private final long workerTasksShutdownTimeoutMs;
     private final int workerUnsyncBackoffMs;
     private final int keyRotationIntervalMs;
     private final String requestSignatureAlgorithm;
     private final List<String> keySignatureVerificationAlgorithms;
     private final KeyGenerator keyGenerator;
+    private final RestClient restClient;
 
     // Visible for testing
     ExecutorService forwardRequestExecutor;
     private final ExecutorService herderExecutor;
-    private final ExecutorService startAndStopExecutor;
+    // Visible for testing
+    ExecutorService startAndStopExecutor;
     private final WorkerGroupMember member;
     private final AtomicBoolean stopping;
     private final boolean isTopicTrackingEnabled;
@@ -198,6 +199,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
     private Set<String> connectorTargetStateChanges = new HashSet<>();
     // Access to this map is protected by the herder's monitor
     private final Map<String, ZombieFencing> activeZombieFencings = new HashMap<>();
+    private final List<String> restNamespace;
     private boolean needsReconfigRebalance;
     private volatile boolean fencedFromConfigTopic;
     private volatile int generation;
@@ -227,9 +229,13 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
      * @param kafkaClusterId     the identifier of the Kafka cluster to use for internal topics; may not be null
      * @param statusBackingStore the backing store for statuses; may not be null
      * @param configBackingStore the backing store for connector configurations; may not be null
-     * @param restUrl            the URL of this herder's REST API; may not be null
+     * @param restUrl            the URL of this herder's REST API; may not be null, but may be an arbitrary placeholder
+     *                           value if this worker does not expose a REST API
+     * @param restClient         a REST client that can be used to issue requests to other workers in the cluster; may
+     *                           be null if inter-worker communication is not enabled
      * @param connectorClientConfigOverridePolicy the policy specifying the client configuration properties that may be overridden
      *                                            in connector configurations; may not be null
+     * @param restNamespace      zero or more path elements to prepend to the paths of forwarded REST requests; may be empty, but not null
      * @param uponShutdown       any {@link AutoCloseable} objects that should be closed when this herder is {@link #stop() stopped},
      *                           after all services and resources owned by this herder are stopped
      */
@@ -240,10 +246,12 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
                              StatusBackingStore statusBackingStore,
                              ConfigBackingStore configBackingStore,
                              String restUrl,
+                             RestClient restClient,
                              ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy,
+                             List<String> restNamespace,
                              AutoCloseable... uponShutdown) {
-        this(config, worker, worker.workerId(), kafkaClusterId, statusBackingStore, configBackingStore, null, restUrl, worker.metrics(),
-             time, connectorClientConfigOverridePolicy, uponShutdown);
+        this(config, worker, worker.workerId(), kafkaClusterId, statusBackingStore, configBackingStore, null, restUrl, restClient, worker.metrics(),
+                time, connectorClientConfigOverridePolicy, restNamespace, uponShutdown);
         configBackingStore.setUpdateListener(new ConfigUpdateListener());
     }
 
@@ -256,9 +264,11 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
                       ConfigBackingStore configBackingStore,
                       WorkerGroupMember member,
                       String restUrl,
+                      RestClient restClient,
                       ConnectMetrics metrics,
                       Time time,
                       ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy,
+                      List<String> restNamespace,
                       AutoCloseable... uponShutdown) {
         super(worker, workerId, kafkaClusterId, statusBackingStore, configBackingStore, connectorClientConfigOverridePolicy);
 
@@ -266,13 +276,14 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         this.herderMetrics = new HerderMetrics(metrics);
         this.workerGroupId = config.getString(DistributedConfig.GROUP_ID_CONFIG);
         this.workerSyncTimeoutMs = config.getInt(DistributedConfig.WORKER_SYNC_TIMEOUT_MS_CONFIG);
-        this.workerTasksShutdownTimeoutMs = config.getLong(DistributedConfig.TASK_SHUTDOWN_GRACEFUL_TIMEOUT_MS_CONFIG);
         this.workerUnsyncBackoffMs = config.getInt(DistributedConfig.WORKER_UNSYNC_BACKOFF_MS_CONFIG);
         this.requestSignatureAlgorithm = config.getString(DistributedConfig.INTER_WORKER_SIGNATURE_ALGORITHM_CONFIG);
         this.keyRotationIntervalMs = config.getInt(DistributedConfig.INTER_WORKER_KEY_TTL_MS_CONFIG);
         this.keySignatureVerificationAlgorithms = config.getList(DistributedConfig.INTER_WORKER_VERIFICATION_ALGORITHMS_CONFIG);
         this.keyGenerator = config.getInternalRequestKeyGenerator();
+        this.restClient = restClient;
         this.isTopicTrackingEnabled = config.getBoolean(TOPIC_TRACKING_ENABLE_CONFIG);
+        this.restNamespace = Objects.requireNonNull(restNamespace);
         this.uponShutdown = Arrays.asList(uponShutdown);
 
         String clientIdConfig = config.getString(CommonClientConfigs.CLIENT_ID_CONFIG);
@@ -431,7 +442,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         //       Another example: if multiple configurations are submitted for the same connector,
         //       the only one that actually has to be written to the config topic is the
         //       most-recently one.
-        long nextRequestTimeoutMs = Long.MAX_VALUE;
+        Long scheduledTick = null;
         while (true) {
             final DistributedHerderRequest next = peekWithoutException();
             if (next == null) {
@@ -439,7 +450,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
             } else if (now >= next.at) {
                 requests.pollFirst();
             } else {
-                nextRequestTimeoutMs = next.at - now;
+                scheduledTick = next.at;
                 break;
             }
 
@@ -450,15 +461,15 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         processRestartRequests();
 
         if (scheduledRebalance < Long.MAX_VALUE) {
-            nextRequestTimeoutMs = Math.min(nextRequestTimeoutMs, Math.max(scheduledRebalance - now, 0));
+            scheduledTick = scheduledTick != null ? Math.min(scheduledTick, scheduledRebalance) : scheduledRebalance;
             rebalanceResolved = false;
-            log.debug("Scheduled rebalance at: {} (now: {} nextRequestTimeoutMs: {}) ",
-                    scheduledRebalance, now, nextRequestTimeoutMs);
+            log.debug("Scheduled rebalance at: {} (now: {} scheduledTick: {}) ",
+                    scheduledRebalance, now, scheduledTick);
         }
         if (isLeader() && internalRequestValidationEnabled() && keyExpiration < Long.MAX_VALUE) {
-            nextRequestTimeoutMs = Math.min(nextRequestTimeoutMs, Math.max(keyExpiration - now, 0));
-            log.debug("Scheduled next key rotation at: {} (now: {} nextRequestTimeoutMs: {}) ",
-                    keyExpiration, now, nextRequestTimeoutMs);
+            scheduledTick = scheduledTick != null ? Math.min(scheduledTick, keyExpiration) : keyExpiration;
+            log.debug("Scheduled next key rotation at: {} (now: {} scheduledTick: {}) ",
+                    keyExpiration, now, scheduledTick);
         }
 
         // Process any configuration updates
@@ -506,6 +517,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
 
         // Let the group take any actions it needs to
         try {
+            long nextRequestTimeoutMs = scheduledTick != null ? Math.max(scheduledTick - time.milliseconds(), 0L) : Long.MAX_VALUE;
             log.trace("Polling for group activity; will wait for {}ms or until poll is interrupted by "
                     + "either config backing store updates or a new external request",
                     nextRequestTimeoutMs);
@@ -655,6 +667,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         // If we only have connector config updates, we can just bounce the updated connectors that are
         // currently assigned to this worker.
         Set<String> localConnectors = assignment == null ? Collections.emptySet() : new HashSet<>(assignment.connectors());
+        Collection<Callable<Void>> connectorsToStart = new ArrayList<>();
         log.trace("Processing connector config updates; "
                 + "currently-owned connectors are {}, and to-be-updated connectors are {}",
                 localConnectors,
@@ -671,13 +684,10 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
             worker.stopAndAwaitConnector(connectorName);
             // The update may be a deletion, so verify we actually need to restart the connector
             if (remains) {
-                startConnector(connectorName, (error, result) -> {
-                    if (error != null) {
-                        log.error("Failed to start connector '" + connectorName + "'", error);
-                    }
-                });
+                connectorsToStart.add(getConnectorStartingCallable(connectorName));
             }
         }
+        startAndStop(connectorsToStart);
     }
 
     private void processTargetStateChanges(Set<String> connectorTargetStateChanges) {
@@ -744,14 +754,8 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         synchronized (this) {
             // Clean up any connectors and tasks that are still running.
             log.info("Stopping connectors and tasks that are still assigned to this worker.");
-            List<Callable<Void>> callables = new ArrayList<>();
-            for (String connectorName : new ArrayList<>(worker.connectorNames())) {
-                callables.add(getConnectorStoppingCallable(connectorName));
-            }
-            for (ConnectorTaskId taskId : new ArrayList<>(worker.taskIds())) {
-                callables.add(getTaskStoppingCallable(taskId));
-            }
-            startAndStop(callables);
+            worker.stopAndAwaitConnectors();
+            worker.stopAndAwaitTasks();
 
             member.stop();
 
@@ -776,6 +780,14 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         }
     }
 
+    // Timeout for herderExecutor to gracefully terminate is set to a value to accommodate
+    // reading to the end of the config topic + successfully attempting to stop all connectors and tasks and a buffer of 10s
+    private long herderExecutorTimeoutMs() {
+        return this.workerSyncTimeoutMs +
+                config.getLong(DistributedConfig.TASK_SHUTDOWN_GRACEFUL_TIMEOUT_MS_CONFIG) +
+                Worker.CONNECTOR_GRACEFUL_SHUTDOWN_TIMEOUT_MS + 10000;
+    }
+
     @Override
     public void stop() {
         log.info("Herder stopping");
@@ -784,7 +796,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         member.wakeup();
         herderExecutor.shutdown();
         try {
-            if (!herderExecutor.awaitTermination(workerTasksShutdownTimeoutMs, TimeUnit.MILLISECONDS))
+            if (!herderExecutor.awaitTermination(herderExecutorTimeoutMs(), TimeUnit.MILLISECONDS))
                 herderExecutor.shutdownNow();
 
             forwardRequestExecutor.shutdown();
@@ -938,18 +950,18 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
                         if (exactlyOnceSupport == null) {
                             validationErrorMessage = "The connector does not implement the API required for preflight validation of exactly-once "
                                     + "source support. Please consult the documentation for the connector to determine whether it supports exactly-once "
-                                    + "guarantees, and then consider reconfiguring the connector to use the value \""
+                                    + "semantics, and then consider reconfiguring the connector to use the value \""
                                     + SourceConnectorConfig.ExactlyOnceSupportLevel.REQUESTED
                                     + "\" for this property (which will disable this preflight check and allow the connector to be created).";
                         } else if (ExactlyOnceSupport.UNSUPPORTED.equals(exactlyOnceSupport)) {
-                            validationErrorMessage = "The connector does not support exactly-once delivery guarantees with the provided configuration.";
+                            validationErrorMessage = "The connector does not support exactly-once semantics with the provided configuration.";
                         } else {
                             throw new ConnectException("Unexpected value returned from SourceConnector::exactlyOnceSupport: " + exactlyOnceSupport);
                         }
                         validatedExactlyOnceSupport.addErrorMessage(validationErrorMessage);
                     }
                 } catch (Exception e) {
-                    log.error("Failed while validating connector support for exactly-once guarantees", e);
+                    log.error("Failed while validating connector support for exactly-once semantics", e);
                     String validationErrorMessage = "An unexpected error occurred during validation";
                     String failureMessage = e.getMessage();
                     if (failureMessage != null && !failureMessage.trim().isEmpty()) {
@@ -1059,8 +1071,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
                             // Note that we use the updated connector config despite the fact that we don't have an updated
                             // snapshot yet. The existing task info should still be accurate.
                             ConnectorInfo info = new ConnectorInfo(connName, config, configState.tasks(connName),
-                                // validateConnectorConfig have checked the existence of CONNECTOR_CLASS_CONFIG
-                                connectorTypeForConfig(config));
+                                connectorType(config));
                             callback.onCompletion(null, new Created<>(!exists, info));
                             return null;
                         },
@@ -1157,16 +1168,34 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
             if (error == null) {
                 callback.onCompletion(null, null);
             } else if (error instanceof NotLeaderException) {
-                String forwardedUrl = ((NotLeaderException) error).forwardUrl() + "connectors/" + id.connector() + "/fence";
-                log.trace("Forwarding zombie fencing request for connector {} to leader at {}", id.connector(), forwardedUrl);
-                forwardRequestExecutor.execute(() -> {
-                    try {
-                        RestClient.httpRequest(forwardedUrl, "PUT", null, null, null, config, sessionKey, requestSignatureAlgorithm);
-                        callback.onCompletion(null, null);
-                    } catch (Throwable t) {
-                        callback.onCompletion(t, null);
-                    }
-                });
+                if (restClient != null) {
+                    String workerUrl = ((NotLeaderException) error).forwardUrl();
+                    String fenceUrl = namespacedUrl(workerUrl)
+                            .path("connectors")
+                            .path(id.connector())
+                            .path("fence")
+                            .build()
+                            .toString();
+                    log.trace("Forwarding zombie fencing request for connector {} to leader at {}", id.connector(), fenceUrl);
+                    forwardRequestExecutor.execute(() -> {
+                        try {
+                            restClient.httpRequest(fenceUrl, "PUT", null, null, null, sessionKey, requestSignatureAlgorithm);
+                            callback.onCompletion(null, null);
+                        } catch (Throwable t) {
+                            callback.onCompletion(t, null);
+                        }
+                    });
+                } else {
+                    callback.onCompletion(
+                            new ConnectException(
+                                    "This worker is not able to communicate with the leader of the cluster, "
+                                            + "which is required for exactly-once source tasks. If running MirrorMaker 2 "
+                                            + "in dedicated mode, consider enabling inter-worker communication via the "
+                                            + "'dedicated.mode.enable.internal.rest' property."
+                            ),
+                            null
+                    );
+                }
             } else {
                 error = ConnectUtils.maybeWrap(error, "Failed to perform zombie fencing");
                 callback.onCompletion(error, null);
@@ -1598,7 +1627,9 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
     }
 
     /**
-     * Try to read to the end of the config log within the given timeout
+     * Try to read to the end of the config log within the given timeout and capture a fresh snapshot via
+     * {@link ConfigBackingStore#snapshot()}
+     *
      * @param timeoutMs maximum time to wait to sync to the end of the log
      * @return true if successful; false if timed out
      */
@@ -1640,11 +1671,20 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         backoffRetries = BACKOFF_RETRIES;
     }
 
-    private void startAndStop(Collection<Callable<Void>> callables) {
+    // Visible for testing
+    void startAndStop(Collection<Callable<Void>> callables) {
         try {
             startAndStopExecutor.invokeAll(callables);
         } catch (InterruptedException e) {
             // ignore
+        } catch (RejectedExecutionException e) {
+            // Shutting down. Just log the exception
+            if (stopping.get()) {
+                log.debug("Ignoring RejectedExecutionException thrown while starting/stopping connectors/tasks en masse " +
+                        "as the herder is already in the process of shutting down. This is not indicative of a problem and is normal behavior");
+            } else {
+                throw e;
+            }
         }
     }
 
@@ -1687,7 +1727,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         log.info("Finished starting connectors and tasks");
     }
 
-    // arguments should assignment collections (connectors or tasks) and should not be null
+    // arguments should be assignment collections (connectors or tasks) and should not be null
     private static <T> Collection<T> assignmentDifference(Collection<T> update, Collection<T> running) {
         if (running.isEmpty()) {
             return update;
@@ -1700,7 +1740,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
     private boolean startTask(ConnectorTaskId taskId) {
         log.info("Starting task {}", taskId);
         Map<String, String> connProps = configState.connectorConfig(taskId.connector());
-        switch (connectorTypeForConfig(connProps)) {
+        switch (connectorType(connProps)) {
             case SINK:
                 return worker.startSinkTask(
                         taskId,
@@ -1906,6 +1946,13 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
                 if (isLeader()) {
                     writeToConfigTopicAsLeader(() -> configBackingStore.putTaskConfigs(connName, rawTaskProps));
                     cb.onCompletion(null, null);
+                } else if (restClient == null) {
+                    throw new NotLeaderException("This worker is not able to communicate with the leader of the cluster, "
+                            + "which is required for dynamically-reconfiguring connectors. If running MirrorMaker 2 "
+                            + "in dedicated mode, consider enabling inter-worker communication via the "
+                            + "'dedicated.mode.enable.internal.rest' property.",
+                            leaderUrl()
+                    );
                 } else {
                     // We cannot forward the request on the same thread because this reconfiguration can happen as a result of connector
                     // addition or removal. If we blocked waiting for the response from leader, we may be kicked out of the worker group.
@@ -1918,15 +1965,16 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
                                         "because the URL of the leader's REST interface is empty!"), null);
                                 return;
                             }
-                            String reconfigUrl = UriBuilder.fromUri(leaderUrl)
+                            String reconfigUrl = namespacedUrl(leaderUrl)
                                     .path("connectors")
                                     .path(connName)
                                     .path("tasks")
                                     .build()
                                     .toString();
                             log.trace("Forwarding task configurations for connector {} to leader", connName);
-                            RestClient.httpRequest(reconfigUrl, "POST", null, rawTaskProps, null, config, sessionKey, requestSignatureAlgorithm);
+                            restClient.httpRequest(reconfigUrl, "POST", null, rawTaskProps, null, sessionKey, requestSignatureAlgorithm);
                             cb.onCompletion(null, null);
+                            log.trace("Request to leader to reconfigure connector tasks succeeded");
                         } catch (ConnectException e) {
                             log.error("Request to leader to reconfigure connector tasks failed", e);
                             cb.onCompletion(e, null);
@@ -2377,7 +2425,7 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
     }
 
     private boolean isSourceConnector(String connName) {
-        return ConnectorType.SOURCE.equals(connectorTypeForConfig(configState.connectorConfig(connName)));
+        return ConnectorType.SOURCE.equals(connectorType(configState.connectorConfig(connName)));
     }
 
     /**
@@ -2420,6 +2468,14 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         }
 
         return false;
+    }
+
+    private UriBuilder namespacedUrl(String workerUrl) {
+        UriBuilder result = UriBuilder.fromUri(workerUrl);
+        for (String namespacePath : restNamespace) {
+            result = result.path(namespacePath);
+        }
+        return result;
     }
 
     /**
@@ -2539,6 +2595,9 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
         }
     }
 
+    /**
+     * A collection of cluster rebalance related metrics.
+     */
     class HerderMetrics {
         private final MetricGroup metricGroup;
         private final Sensor rebalanceCompletedCounts;

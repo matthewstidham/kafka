@@ -33,7 +33,6 @@ import org.apache.kafka.common.errors.ProducerFencedException;
 import org.apache.kafka.common.resource.PatternType;
 import org.apache.kafka.common.resource.ResourcePattern;
 import org.apache.kafka.common.resource.ResourceType;
-import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.connect.connector.Task;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.json.JsonConverter;
@@ -160,7 +159,7 @@ public class ExactlyOnceSourceIntegrationTest {
     }
 
     /**
-     * A simple test for the pre-flight validation API for connectors to provide their own delivery guarantees.
+     * A simple test for the pre-flight validation API for connectors to provide their own guarantees for exactly-once semantics.
      */
     @Test
     public void testPreflightValidation() {
@@ -643,10 +642,12 @@ public class ExactlyOnceSourceIntegrationTest {
         final String globalOffsetsTopic = "connect-worker-offsets-topic";
         workerProps.put(DistributedConfig.OFFSET_STORAGE_TOPIC_CONFIG, globalOffsetsTopic);
 
+        connectBuilder.clientConfigs(superUserClientConfig);
+
         startConnect();
 
         String topic = "test-topic";
-        Admin admin = connect.kafka().createAdminClient(Utils.mkProperties(superUserClientConfig));
+        Admin admin = connect.kafka().createAdminClient();
         admin.createTopics(Collections.singleton(new NewTopic(topic, 3, (short) 1))).all().get();
 
         Map<String, String> props = new HashMap<>();
@@ -726,8 +727,8 @@ public class ExactlyOnceSourceIntegrationTest {
      * Then, a "soft downgrade" is simulated: the Connect cluster is shut down and reconfigured to disable
      * exactly-once support. The cluster is brought up again, the connector is allowed to produce some data,
      * the connector is shut down, and this time, the records the connector has produced are inspected for
-     * accuracy. Because of the downgrade, exactly-once guarantees are lost, but we check to make sure that
-     * the task has maintained exactly-once delivery <i>up to the last-committed record</i>.
+     * accuracy. Because of the downgrade, exactly-once semantics are lost, but we check to make sure that
+     * the task has maintained exactly-once semantics <i>up to the last-committed record</i>.
      */
     @Test
     public void testSeparateOffsetsTopic() throws Exception {
@@ -857,7 +858,7 @@ public class ExactlyOnceSourceIntegrationTest {
             );
             assertTrue("Not enough records produced by source connector. Expected at least: " + recordsProduced + " + but got " + sourceRecords.count(),
                     sourceRecords.count() >= recordsProduced);
-            // also have to check which offsets have actually been committed, since we no longer have exactly-once guarantees
+            // also have to check which offsets have actually been committed, since we no longer have exactly-once semantics
             offsetRecords = connectorTargetedCluster.consumeAll(
                     CONSUME_RECORDS_TIMEOUT_MS,
                     Collections.singletonMap(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed"),

@@ -16,6 +16,8 @@
  */
 package kafka.controller
 
+import com.yammer.metrics.core.Timer
+
 import java.util.concurrent.TimeUnit
 import kafka.admin.AdminOperationException
 import kafka.api._
@@ -23,7 +25,7 @@ import kafka.common._
 import kafka.cluster.Broker
 import kafka.controller.KafkaController.{AlterReassignmentsCallback, ElectLeadersCallback, ListReassignmentsCallback, UpdateFeaturesCallback}
 import kafka.coordinator.transaction.ZkProducerIdManager
-import kafka.metrics.{KafkaMetricsGroup, KafkaTimer}
+import kafka.metrics.KafkaMetricsGroup
 import kafka.server._
 import kafka.server.metadata.ZkFinalizedFeatureCache
 import kafka.utils._
@@ -45,6 +47,7 @@ import org.apache.kafka.common.requests.{AbstractControlRequest, ApiError, Leade
 import org.apache.kafka.common.utils.{Time, Utils}
 import org.apache.kafka.metadata.LeaderRecoveryState
 import org.apache.kafka.server.common.ProducerIdsBlock
+import org.apache.kafka.server.util.KafkaScheduler
 import org.apache.zookeeper.KeeperException
 import org.apache.zookeeper.KeeperException.Code
 
@@ -88,8 +91,14 @@ class KafkaController(val config: KafkaConfig,
   private val isAlterPartitionEnabled = config.interBrokerProtocolVersion.isAlterPartitionSupported
   private val stateChangeLogger = new StateChangeLogger(config.brokerId, inControllerContext = true, None)
   val controllerContext = new ControllerContext
-  var controllerChannelManager = new ControllerChannelManager(controllerContext, config, time, metrics,
-    stateChangeLogger, threadNamePrefix)
+  var controllerChannelManager = new ControllerChannelManager(
+    () => controllerContext.epoch,
+    config,
+    time,
+    metrics,
+    stateChangeLogger,
+    threadNamePrefix
+  )
 
   // have a separate scheduler for the controller to be able to start and stop independently of the kafka server
   // visible for testing
@@ -131,7 +140,7 @@ class KafkaController(val config: KafkaConfig,
   @volatile private var activeBrokerCount = 0
 
   /* single-thread scheduler to clean expired tokens */
-  private val tokenCleanScheduler = new KafkaScheduler(threads = 1, threadNamePrefix = "delegation-token-cleaner")
+  private val tokenCleanScheduler = new KafkaScheduler(1, true, "delegation-token-cleaner")
 
   newGauge("ActiveControllerCount", () => if (isActive) 1 else 0)
   newGauge("OfflinePartitionsCount", () => offlinePartitionCount)
@@ -284,10 +293,10 @@ class KafkaController(val config: KafkaConfig,
     if (config.tokenAuthEnabled) {
       info("starting the token expiry check scheduler")
       tokenCleanScheduler.startup()
-      tokenCleanScheduler.schedule(name = "delete-expired-tokens",
-        fun = () => tokenManager.expireTokens(),
-        period = config.delegationTokenExpiryCheckIntervalMs,
-        unit = TimeUnit.MILLISECONDS)
+      tokenCleanScheduler.schedule("delete-expired-tokens",
+        () => tokenManager.expireTokens(),
+        0L,
+        config.delegationTokenExpiryCheckIntervalMs)
     }
   }
 
@@ -450,8 +459,9 @@ class KafkaController(val config: KafkaConfig,
   }
 
   private def scheduleAutoLeaderRebalanceTask(delay: Long, unit: TimeUnit): Unit = {
-    kafkaScheduler.schedule("auto-leader-rebalance-task", () => eventManager.put(AutoPreferredReplicaLeaderElection),
-      delay = delay, unit = unit)
+    kafkaScheduler.scheduleOnce("auto-leader-rebalance-task",
+      () => eventManager.put(AutoPreferredReplicaLeaderElection),
+      unit.toMillis(delay))
   }
 
   /**
@@ -471,8 +481,7 @@ class KafkaController(val config: KafkaConfig,
     kafkaScheduler.shutdown()
 
     // stop token expiry check scheduler
-    if (tokenCleanScheduler.isStarted)
-      tokenCleanScheduler.shutdown()
+    tokenCleanScheduler.shutdown()
 
     // de-register partition ISR listener for on-going partition reassignment task
     unregisterPartitionReassignmentIsrChangeHandlers()
@@ -926,7 +935,7 @@ class KafkaController(val config: KafkaConfig,
     // update the leader and isr cache for all existing partitions from Zookeeper
     updateLeaderAndIsrCache()
     // start the channel manager
-    controllerChannelManager.startup()
+    controllerChannelManager.startup(controllerContext.liveOrShuttingDownBrokers)
     info(s"Currently active brokers in the cluster: ${controllerContext.liveBrokerIds}")
     info(s"Currently shutting brokers in the cluster: ${controllerContext.shuttingDownBrokerIds}")
     info(s"Current list of topics in the cluster: ${controllerContext.allTopics}")
@@ -1260,10 +1269,7 @@ class KafkaController(val config: KafkaConfig,
       // check ratio and if greater than desired ratio, trigger a rebalance for the topic partitions
       // that need to be on this broker
       if (imbalanceRatio > (config.leaderImbalancePerBrokerPercentage.toDouble / 100)) {
-        // do this check only if the broker is live and there are no partitions being reassigned currently
-        // and preferred replica election is not in progress
         val candidatePartitions = topicsNotInPreferredReplica.keys.filter(tp =>
-          controllerContext.partitionsBeingReassigned.isEmpty &&
           !topicDeletionManager.isTopicQueuedUpForDeletion(tp.topic) &&
           controllerContext.allTopics.contains(tp.topic) &&
           canPreferredReplicaBeLeader(tp)
@@ -2724,9 +2730,9 @@ case class LeaderIsrAndControllerEpoch(leaderAndIsr: LeaderAndIsr, controllerEpo
 private[controller] class ControllerStats extends KafkaMetricsGroup {
   val uncleanLeaderElectionRate = newMeter("UncleanLeaderElectionsPerSec", "elections", TimeUnit.SECONDS)
 
-  val rateAndTimeMetrics: Map[ControllerState, KafkaTimer] = ControllerState.values.flatMap { state =>
+  val rateAndTimeMetrics: Map[ControllerState, Timer] = ControllerState.values.flatMap { state =>
     state.rateAndTimeMetricName.map { metricName =>
-      state -> new KafkaTimer(newTimer(metricName, TimeUnit.MILLISECONDS, TimeUnit.SECONDS))
+      state -> newTimer(metricName, TimeUnit.MILLISECONDS, TimeUnit.SECONDS)
     }
   }.toMap
 

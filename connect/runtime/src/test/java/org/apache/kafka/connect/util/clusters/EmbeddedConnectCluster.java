@@ -54,7 +54,7 @@ import static org.apache.kafka.clients.consumer.ConsumerConfig.GROUP_ID_CONFIG;
 import static org.apache.kafka.connect.runtime.ConnectorConfig.KEY_CONVERTER_CLASS_CONFIG;
 import static org.apache.kafka.connect.runtime.ConnectorConfig.VALUE_CONVERTER_CLASS_CONFIG;
 import static org.apache.kafka.connect.runtime.WorkerConfig.BOOTSTRAP_SERVERS_CONFIG;
-import static org.apache.kafka.connect.runtime.WorkerConfig.LISTENERS_CONFIG;
+import static org.apache.kafka.connect.runtime.rest.RestServerConfig.LISTENERS_CONFIG;
 import static org.apache.kafka.connect.runtime.distributed.DistributedConfig.CONFIG_STORAGE_REPLICATION_FACTOR_CONFIG;
 import static org.apache.kafka.connect.runtime.distributed.DistributedConfig.CONFIG_TOPIC_CONFIG;
 import static org.apache.kafka.connect.runtime.distributed.DistributedConfig.OFFSET_STORAGE_REPLICATION_FACTOR_CONFIG;
@@ -94,11 +94,12 @@ public class EmbeddedConnectCluster {
 
     private EmbeddedConnectCluster(String name, Map<String, String> workerProps, int numWorkers,
                                    int numBrokers, Properties brokerProps,
-                                   boolean maskExitProcedures) {
+                                   boolean maskExitProcedures,
+                                   Map<String, String> additionalKafkaClusterClientConfigs) {
         this.workerProps = workerProps;
         this.connectClusterName = name;
         this.numBrokers = numBrokers;
-        this.kafkaCluster = new EmbeddedKafkaCluster(numBrokers, brokerProps);
+        this.kafkaCluster = new EmbeddedKafkaCluster(numBrokers, brokerProps, additionalKafkaClusterClientConfigs);
         this.connectCluster = new LinkedHashSet<>();
         this.numInitialWorkers = numWorkers;
         this.maskExitProcedures = maskExitProcedures;
@@ -260,7 +261,7 @@ public class EmbeddedConnectCluster {
         putIfAbsent(workerProps, OFFSET_STORAGE_REPLICATION_FACTOR_CONFIG, internalTopicsReplFactor);
         putIfAbsent(workerProps, CONFIG_TOPIC_CONFIG, "connect-config-topic-" + connectClusterName);
         putIfAbsent(workerProps, CONFIG_STORAGE_REPLICATION_FACTOR_CONFIG, internalTopicsReplFactor);
-        putIfAbsent(workerProps, STATUS_STORAGE_TOPIC_CONFIG, "connect-storage-topic-" + connectClusterName);
+        putIfAbsent(workerProps, STATUS_STORAGE_TOPIC_CONFIG, "connect-status-topic-" + connectClusterName);
         putIfAbsent(workerProps, STATUS_STORAGE_REPLICATION_FACTOR_CONFIG, internalTopicsReplFactor);
         putIfAbsent(workerProps, KEY_CONVERTER_CLASS_CONFIG, "org.apache.kafka.connect.storage.StringConverter");
         putIfAbsent(workerProps, VALUE_CONVERTER_CLASS_CONFIG, "org.apache.kafka.connect.storage.StringConverter");
@@ -808,6 +809,8 @@ public class EmbeddedConnectCluster {
         private Properties brokerProps = DEFAULT_BROKER_CONFIG;
         private boolean maskExitProcedures = true;
 
+        private Map<String, String> clientConfigs = new HashMap<>();
+
         public Builder name(String name) {
             this.name = name;
             return this;
@@ -833,6 +836,11 @@ public class EmbeddedConnectCluster {
             return this;
         }
 
+        public Builder clientConfigs(Map<String, String> clientConfigs) {
+            this.clientConfigs.putAll(clientConfigs);
+            return this;
+        }
+
         /**
          * In the event of ungraceful shutdown, embedded clusters call exit or halt with non-zero
          * exit statuses. Exiting with a non-zero status forces a test to fail and is hard to
@@ -852,7 +860,7 @@ public class EmbeddedConnectCluster {
 
         public EmbeddedConnectCluster build() {
             return new EmbeddedConnectCluster(name, workerProps, numWorkers, numBrokers,
-                    brokerProps, maskExitProcedures);
+                    brokerProps, maskExitProcedures, clientConfigs);
         }
     }
 

@@ -17,18 +17,18 @@
 
 package kafka.server
 
-import kafka.api.Request
 import kafka.cluster.BrokerEndPoint
 import kafka.server.AbstractFetcherThread.{ReplicaFetch, ResultWithPartitions}
 import kafka.server.QuotaFactory.UnboundedQuota
 import kafka.utils.Logging
 import org.apache.kafka.common.errors.KafkaStorageException
-import org.apache.kafka.common.{TopicIdPartition, TopicPartition, Uuid}
 import org.apache.kafka.common.message.FetchResponseData
-import org.apache.kafka.common.requests.OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH
 import org.apache.kafka.common.message.OffsetForLeaderEpochResponseData.EpochEndOffset
 import org.apache.kafka.common.protocol.{ApiKeys, Errors}
+import org.apache.kafka.common.requests.OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH
 import org.apache.kafka.common.requests.{FetchRequest, FetchResponse, RequestUtils}
+import org.apache.kafka.common.{TopicIdPartition, TopicPartition, Uuid}
+import org.apache.kafka.storage.internals.log.{FetchIsolation, FetchParams, FetchPartitionData}
 
 import java.util
 import java.util.Optional
@@ -75,8 +75,8 @@ class LocalLeaderEndPoint(sourceBroker: BrokerEndPoint,
 
     def processResponseCallback(responsePartitionData: Seq[(TopicIdPartition, FetchPartitionData)]): Unit = {
       partitionData = responsePartitionData.map { case (tp, data) =>
-        val abortedTransactions = data.abortedTransactions.map(_.asJava).orNull
-        val lastStableOffset = data.lastStableOffset.getOrElse(FetchResponse.INVALID_LAST_STABLE_OFFSET)
+        val abortedTransactions =  data.abortedTransactions.orElse(null)
+        val lastStableOffset: Long = data.lastStableOffset.orElse(FetchResponse.INVALID_LAST_STABLE_OFFSET)
         tp.topicPartition -> new FetchResponseData.PartitionData()
           .setPartitionIndex(tp.topicPartition.partition)
           .setErrorCode(data.error.code)
@@ -90,14 +90,14 @@ class LocalLeaderEndPoint(sourceBroker: BrokerEndPoint,
 
     val fetchData = request.fetchData(topicNames.asJava)
 
-    val fetchParams = FetchParams(
-      requestVersion = request.version,
-      maxWaitMs = 0L, // timeout is 0 so that the callback will be executed immediately
-      replicaId = Request.FutureLocalReplicaId,
-      minBytes = request.minBytes,
-      maxBytes = request.maxBytes,
-      isolation = FetchLogEnd,
-      clientMetadata = None
+    val fetchParams = new FetchParams(
+      request.version,
+      FetchRequest.FUTURE_LOCAL_REPLICA_ID,
+      0L, // timeout is 0 so that the callback will be executed immediately
+      request.minBytes,
+      request.maxBytes,
+      FetchIsolation.LOG_END,
+      Optional.empty()
     )
 
     replicaManager.fetchMessages(
@@ -113,14 +113,25 @@ class LocalLeaderEndPoint(sourceBroker: BrokerEndPoint,
     partitionData.toMap
   }
 
-  override def fetchEarliestOffset(topicPartition: TopicPartition, currentLeaderEpoch: Int): Long = {
+  override def fetchEarliestOffset(topicPartition: TopicPartition, currentLeaderEpoch: Int): (Int, Long) = {
     val partition = replicaManager.getPartitionOrException(topicPartition)
-    partition.localLogOrException.logStartOffset
+    val logStartOffset = partition.localLogOrException.logStartOffset
+    val epoch = partition.localLogOrException.leaderEpochCache.get.epochForOffset(logStartOffset)
+    (epoch.orElse(0), logStartOffset)
   }
 
-  override def fetchLatestOffset(topicPartition: TopicPartition, currentLeaderEpoch: Int): Long = {
+  override def fetchLatestOffset(topicPartition: TopicPartition, currentLeaderEpoch: Int): (Int, Long) = {
     val partition = replicaManager.getPartitionOrException(topicPartition)
-    partition.localLogOrException.logEndOffset
+    val logEndOffset = partition.localLogOrException.logEndOffset
+    val epoch = partition.localLogOrException.leaderEpochCache.get.epochForOffset(logEndOffset)
+    (epoch.orElse(0), logEndOffset)
+  }
+
+  override def fetchEarliestLocalOffset(topicPartition: TopicPartition, currentLeaderEpoch: Int): (Int, Long) = {
+    val partition = replicaManager.getPartitionOrException(topicPartition)
+    val localLogStartOffset = partition.localLogOrException.localLogStartOffset()
+    val epoch = partition.localLogOrException.leaderEpochCache.get.epochForOffset(localLogStartOffset)
+    (epoch.orElse(0), localLogStartOffset)
   }
 
   override def fetchEpochEndOffsets(partitions: collection.Map[TopicPartition, EpochData]): Map[TopicPartition, EpochEndOffset] = {
